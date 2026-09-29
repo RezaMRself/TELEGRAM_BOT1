@@ -76,6 +76,19 @@ except Exception:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MANAGER_BOT_USERNAME = None  # بعد از استارت پر می‌شود
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+# Gemini (Google AI Studio) — متن + تصویر + تحلیل
+GEMINI_API_KEY = (
+    os.environ.get("GEMINI_API_KEY", "").strip()
+    or os.environ.get("GOOGLE_API_KEY", "").strip()
+    or "AQ.Ab8RN6L882bu2pRR17fVsir5vdkOIIB08tmSCVadd3TYiUiclg"
+).strip()
+GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.0-flash").strip()
+GEMINI_IMAGE_MODELS = [
+    m.strip() for m in os.environ.get(
+        "GEMINI_IMAGE_MODELS",
+        "gemini-2.0-flash-preview-image-generation,gemini-2.5-flash-image,gemini-2.0-flash-exp-image-generation"
+    ).split(",") if m.strip()
+]
 
 # اینلاین هلپر ایموجی پریمیوم (بات ساخته‌شده با اکانت پریمیوم)
 HELPER_INLINE_BOT = os.environ.get("HELPER_INLINE_BOT", "SelfmrhelPerbot").strip().lstrip("@")
@@ -6315,18 +6328,168 @@ async def run_emoji_animation(client, message, key: str):
 
 
 
+
+async def _gemini_generate_text(system: str, user: str, max_tokens: int = 1200, temperature: float = 0.85) -> str:
+    """متن با Gemini generateContent"""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY خالی است")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=body, headers={"Content-Type": "application/json"}) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"Gemini HTTP {resp.status}: {raw[:400]}")
+            js = await resp.json() if resp.content_type and "json" in resp.content_type else None
+            if not js:
+                import json as _json
+                js = _json.loads(raw)
+            cands = js.get("candidates") or []
+            if not cands:
+                raise RuntimeError(f"Gemini empty: {raw[:300]}")
+            parts = (((cands[0] or {}).get("content") or {}).get("parts")) or []
+            texts = [str(p.get("text") or "").strip() for p in parts if p.get("text")]
+            out = "\n".join(t for t in texts if t).strip()
+            if not out:
+                raise RuntimeError("Gemini متن خالی برگرداند")
+            return out
+
+
+async def _gemini_generate_image_bytes(prompt: str) -> bytes:
+    """ساخت تصویر با مدل‌های Gemini image — bytes تصویر"""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY خالی است")
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("پرامپت خالی")
+    # پرامپت قوی برای تصویر
+    full_prompt = (
+        f"Generate a high-quality detailed image. Subject: {prompt}. "
+        "Photorealistic, sharp focus, rich colors, 4k quality."
+    )
+    last_err = None
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for model in GEMINI_IMAGE_MODELS:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            bodies = [
+                {
+                    "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["TEXT", "IMAGE"],
+                    },
+                },
+                {
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["IMAGE"],
+                    },
+                },
+            ]
+            for body in bodies:
+                try:
+                    async with session.post(
+                        url, json=body, headers={"Content-Type": "application/json"}
+                    ) as resp:
+                        raw = await resp.text()
+                        if resp.status != 200:
+                            last_err = f"{model} HTTP {resp.status}: {raw[:250]}"
+                            logging.warning("gemini img: %s", last_err)
+                            continue
+                        import json as _json
+                        try:
+                            js = _json.loads(raw)
+                        except Exception:
+                            last_err = f"{model} bad json"
+                            continue
+                        cands = js.get("candidates") or []
+                        for cand in cands:
+                            parts = ((cand.get("content") or {}).get("parts")) or []
+                            for p in parts:
+                                inline = p.get("inlineData") or p.get("inline_data") or {}
+                                data_b64 = inline.get("data")
+                                if data_b64:
+                                    import base64
+                                    return base64.b64decode(data_b64)
+                        last_err = f"{model} no image in response"
+                except Exception as e:
+                    last_err = f"{model}: {e}"
+                    logging.warning("gemini img try: %s", e)
+    raise RuntimeError(last_err or "ساخت تصویر Gemini ناموفق")
+
+
+async def _gemini_analyze_image_path(path: str, question: str = None) -> str:
+    """تحلیل تصویر با Gemini vision"""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY خالی است")
+    if not path or not os.path.exists(path):
+        raise ValueError("فایل تصویر نیست")
+    import base64
+    with open(path, "rb") as f:
+        data_b64 = base64.b64encode(f.read()).decode("ascii")
+    mime = "image/jpeg"
+    low = path.lower()
+    if low.endswith(".png"):
+        mime = "image/png"
+    elif low.endswith(".webp"):
+        mime = "image/webp"
+    elif low.endswith(".gif"):
+        mime = "image/gif"
+    q = question or (
+        "این تصویر را به فارسی روان و دقیق تحلیل کن: "
+        "موضوع اصلی، اشیاء، رنگ‌ها، حس و جزئیات مهم. کوتاه و مفید بنویس."
+    )
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    body = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": q},
+                {"inline_data": {"mime_type": mime, "data": data_b64}},
+            ],
+        }],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
+    }
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=body, headers={"Content-Type": "application/json"}) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"Gemini vision HTTP {resp.status}: {raw[:300]}")
+            import json as _json
+            js = _json.loads(raw)
+            parts = ((((js.get("candidates") or [{}])[0]).get("content") or {}).get("parts")) or []
+            texts = [str(p.get("text") or "").strip() for p in parts if p.get("text")]
+            out = "\n".join(t for t in texts if t).strip()
+            if not out:
+                raise RuntimeError("پاسخ خالی از Gemini")
+            return out[:3500]
+
+
+
 async def ai_expand_text(seed: str) -> str:
-    """گسترش متن با DeepSeek — داستانی، مرتبط، با ایموجی"""
+    """گسترش متن — اول Gemini، بعد DeepSeek"""
     seed = (seed or "").strip()
     if not seed:
         return "❌ متنی برای گسترش وارد نشده."
-
-    if not DEEPSEEK_API_KEY:
-        return (
-            "❌ کلید DeepSeek تنظیم نشده.\n\n"
-            "در سرور این متغیر را بگذار:\n"
-            "`DEEPSEEK_API_KEY=sk-...`"
-        )
 
     system_prompt = (
         "تو نویسنده خلاق فارسی هستی.\n"
@@ -6341,61 +6504,52 @@ async def ai_expand_text(seed: str) -> str:
     )
     user_prompt = f"این متن را گسترش بده و ادامه بده:\n{seed}"
 
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.9,
-        "max_tokens": 1200,
-        "stream": False,
-    }
+    # 1) Gemini
+    if GEMINI_API_KEY:
+        try:
+            out = await _gemini_generate_text(system_prompt, user_prompt, max_tokens=1400, temperature=0.9)
+            if out and len(out) > 20 and not out.startswith("❌"):
+                return out
+        except Exception as e:
+            logging.warning("gemini expand: %s", e)
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                "https://api.deepseek.com/chat/completions",
-                headers=headers,
-                json=payload,
-            ) as resp:
-                raw = await resp.text()
-                if resp.status != 200:
-                    logging.error(f"DeepSeek status={resp.status} body={raw[:300]}")
-                    low = (raw or "").lower()
-                    if resp.status in (401, 403):
-                        return "❌ کلید DeepSeek نامعتبر است. DEEPSEEK_API_KEY را در سرور چک کن."
-                    if resp.status == 402 or "insufficient" in low or "balance" in low:
-                        return (
-                            "❌ موجودی حساب DeepSeek کافی نیست.\n"
-                            "برو به platform.deepseek.com و حساب را شارژ کن."
-                        )
-                    if resp.status == 429:
-                        return "❌ محدودیت درخواست DeepSeek. کمی بعد دوباره تلاش کن."
-                    return f"❌ خطا از DeepSeek ({resp.status})."
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    return "❌ پاسخ نامعتبر از DeepSeek."
-                choices = data.get("choices") or []
-                if not choices:
-                    return "❌ پاسخی از DeepSeek نیامد."
-                text = (
-                    (choices[0].get("message") or {}).get("content")
-                    or choices[0].get("text")
-                    or ""
-                ).strip()
-                if not text:
-                    return "❌ متن خالی از DeepSeek."
-                return text[:3900]
-    except Exception as e:
-        logging.error(f"DeepSeek error: {e}")
-        return f"❌ خطا در اتصال به DeepSeek:\n{e}"
+    # 2) DeepSeek fallback
+    if DEEPSEEK_API_KEY:
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.9,
+            "max_tokens": 1200,
+            "stream": False,
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://api.deepseek.com/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status == 200:
+                        import json as _json
+                        js = _json.loads(raw)
+                        t = js["choices"][0]["message"]["content"]
+                        if t and str(t).strip():
+                            return str(t).strip()
+                    logging.warning("deepseek expand status=%s body=%s", resp.status, raw[:200])
+        except Exception as e:
+            logging.warning("deepseek expand: %s", e)
+
+    return "❌ سرویس هوش مصنوعی در دسترس نیست. GEMINI_API_KEY یا DEEPSEEK_API_KEY را چک کن."
+
 
 
 def _clean_track_name(name: str) -> str:
@@ -10592,20 +10746,39 @@ async def _prompt_to_english(prompt: str) -> str:
 
 
 async def ai_generate_image_file(prompt: str) -> str:
-    """تولید تصویر — ترجمه + چند endpoint"""
+    """تولید تصویر — اول Gemini، بعد pollinations"""
     import urllib.parse
     prompt = (prompt or "").strip()
     if not prompt:
         raise ValueError("پرامپت خالی")
+    seed = int(time.time()) % 1000000
+    path = f"/tmp/ai_img_{int(time.time())}_{seed}.jpg"
+
+    # 1) Gemini image models
+    if GEMINI_API_KEY:
+        try:
+            en = await _prompt_to_english(prompt)
+            data = await _gemini_generate_image_bytes(en or prompt)
+            if data and len(data) > 2000:
+                # detect png vs jpg
+                out = path
+                if data[:8] == b"\x89PNG\r\n\x1a\n":
+                    out = path.replace(".jpg", ".png")
+                with open(out, "wb") as f:
+                    f.write(data)
+                logging.info("gemini image ok bytes=%s path=%s", len(data), out)
+                return out
+        except Exception as e:
+            logging.warning("gemini image gen: %s", e)
+
+    # 2) pollinations fallback
     en = await _prompt_to_english(prompt)
     full = f"{en}, photorealistic, highly detailed, 4k"
-    seed = int(time.time()) % 1000000
     candidates = [
         f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}?width=1024&height=1024&nologo=true&model=flux&seed={seed}",
         f"https://image.pollinations.ai/prompt/{urllib.parse.quote(en)}?width=1024&height=1024&nologo=true&seed={seed}",
         f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}?width=768&height=768&nologo=true",
     ]
-    path = f"/tmp/ai_img_{int(time.time())}_{seed}.jpg"
     last_err = None
     timeout = aiohttp.ClientTimeout(total=180)
     headers = {
@@ -10625,55 +10798,36 @@ async def ai_generate_image_file(prompt: str) -> str:
                     if len(data) < 3000:
                         last_err = f"small body {len(data)}"
                         continue
-                    is_jpg = len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8
-                    is_png = len(data) >= 4 and data[0] == 0x89 and data[1:4] == b"PNG"
-                    if (not is_jpg) and (not is_png) and ("image" not in ctype):
-                        last_err = f"not image ctype={ctype}"
+                    is_img = (
+                        data[:3] == b"\xff\xd8\xff"
+                        or data[:8] == b"\x89PNG\r\n\x1a\n"
+                        or data[:4] == b"RIFF"
+                        or "image" in ctype
+                    )
+                    if not is_img:
+                        last_err = "not image"
                         continue
                     with open(path, "wb") as f:
                         f.write(data)
                     return path
             except Exception as e:
                 last_err = str(e)
-                logging.warning("ai_img try fail: %s", e)
-    raise RuntimeError(last_err or "unknown")
+                logging.warning("pollinations img: %s", e)
+    raise RuntimeError(last_err or "ساخت تصویر ناموفق")
 
-
-async def _temp_host_image(path: str) -> str:
-    """آپلود موقت تصویر برای تحلیل"""
-    if not path or not os.path.exists(path):
-        return ""
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            with open(path, "rb") as f:
-                data = f.read()
-            form = aiohttp.FormData()
-            form.add_field("reqtype", "fileupload")
-            form.add_field("fileToUpload", data, filename="photo.jpg", content_type="image/jpeg")
-            async with session.post("https://catbox.moe/user/api.php", data=form) as resp:
-                txt = (await resp.text()).strip()
-                if txt.startswith("http"):
-                    return txt
-    except Exception as e:
-        logging.warning("catbox: %s", e)
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            with open(path, "rb") as f:
-                form = aiohttp.FormData()
-                form.add_field("file", f, filename="photo.jpg", content_type="image/jpeg")
-                async with session.post("https://0x0.st", data=form) as resp:
-                    txt = (await resp.text()).strip()
-                    if txt.startswith("http"):
-                        return txt
-    except Exception as e:
-        logging.warning("0x0: %s", e)
-    return ""
 
 
 async def ai_analyze_image_file(path: str) -> str:
-    """تحلیل تصویر"""
+    """تحلیل تصویر — اول Gemini، بعد بقیه"""
     if not path or not os.path.exists(path):
         return "❌ فایل تصویر دانلود نشد."
+    if GEMINI_API_KEY:
+        try:
+            out = await _gemini_analyze_image_path(path)
+            if out and len(out) > 15:
+                return out
+        except Exception as e:
+            logging.warning("gemini analyze: %s", e)
     img_url = await _temp_host_image(path)
     # 1) pollinations openai endpoint
     try:
@@ -10768,6 +10922,13 @@ async def ai_summarize_texts(texts: list) -> str:
         "تو یک خلاصه‌کننده فارسی هستی. مکالمه زیر را کوتاه، مرتب و با بولت‌پوینت خلاصه کن. "
         "نکات مهم و نتیجه‌گیری را بنویس."
     )
+    if GEMINI_API_KEY:
+        try:
+            out = await _gemini_generate_text(system, joined, max_tokens=1200, temperature=0.4)
+            if out and len(out) > 20:
+                return out
+        except Exception as e:
+            logging.warning("gemini summary: %s", e)
     if DEEPSEEK_API_KEY:
         try:
             headers = {
