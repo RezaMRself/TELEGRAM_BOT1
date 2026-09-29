@@ -80,8 +80,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 GEMINI_API_KEY = (
     os.environ.get("GEMINI_API_KEY", "").strip()
     or os.environ.get("GOOGLE_API_KEY", "").strip()
-    or "AQ.Ab8RN6L882bu2pRR17fVsir5vdkOIIB08tmSCVadd3TYiUiclg"
-).strip()
+)
 GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.0-flash").strip()
 GEMINI_IMAGE_MODELS = [
     m.strip() for m in os.environ.get(
