@@ -6366,69 +6366,62 @@ async def _gemini_generate_text(system: str, user: str, max_tokens: int = 1200, 
             return out
 
 
+
 async def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """ساخت تصویر با مدل‌های Gemini image — bytes تصویر"""
+    """ساخت تصویر با مدل‌های Gemini — روی 402 سریع قطع می‌شود"""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY خالی است")
     prompt = (prompt or "").strip()
     if not prompt:
         raise ValueError("پرامپت خالی")
-    # پرامپت قوی برای تصویر
+    # پرامپت خیلی صریح تا موضوع اشتباه نشود
     full_prompt = (
-        f"Generate a high-quality detailed image. Subject: {prompt}. "
-        "Photorealistic, sharp focus, rich colors, 4k quality."
+        f"Generate one single photorealistic image of exactly this subject: {prompt}.\n"
+        f"The main subject MUST be: {prompt}.\n"
+        "Rules: match the subject precisely; do not replace the subject with a person "
+        "unless the user explicitly asked for a person; no text watermark; high detail."
     )
     last_err = None
-    timeout = aiohttp.ClientTimeout(total=180)
+    timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model in GEMINI_IMAGE_MODELS:
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={GEMINI_API_KEY}"
             )
-            bodies = [
-                {
-                    "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-                    "generationConfig": {
-                        "responseModalities": ["TEXT", "IMAGE"],
-                    },
-                },
-                {
-                    "contents": [{"parts": [{"text": full_prompt}]}],
-                    "generationConfig": {
-                        "responseModalities": ["IMAGE"],
-                    },
-                },
-            ]
-            for body in bodies:
-                try:
-                    async with session.post(
-                        url, json=body, headers={"Content-Type": "application/json"}
-                    ) as resp:
-                        raw = await resp.text()
-                        if resp.status != 200:
-                            last_err = f"{model} HTTP {resp.status}: {raw[:250]}"
-                            logging.warning("gemini img: %s", last_err)
-                            continue
-                        import json as _json
-                        try:
-                            js = _json.loads(raw)
-                        except Exception:
-                            last_err = f"{model} bad json"
-                            continue
-                        cands = js.get("candidates") or []
-                        for cand in cands:
-                            parts = ((cand.get("content") or {}).get("parts")) or []
-                            for p in parts:
-                                inline = p.get("inlineData") or p.get("inline_data") or {}
-                                data_b64 = inline.get("data")
-                                if data_b64:
-                                    import base64
-                                    return base64.b64decode(data_b64)
-                        last_err = f"{model} no image in response"
-                except Exception as e:
-                    last_err = f"{model}: {e}"
-                    logging.warning("gemini img try: %s", e)
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+            }
+            try:
+                async with session.post(
+                    url, json=body, headers={"Content-Type": "application/json"}
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status == 402:
+                        raise RuntimeError("Gemini 402 Payment Required — سهمیه/بilled نیست")
+                    if resp.status == 429:
+                        last_err = f"{model} rate limit"
+                        continue
+                    if resp.status != 200:
+                        last_err = f"{model} HTTP {resp.status}: {raw[:200]}"
+                        logging.warning("gemini img: %s", last_err)
+                        # 404 model not found → try next
+                        continue
+                    import json as _json, base64
+                    js = _json.loads(raw)
+                    for cand in (js.get("candidates") or []):
+                        for p in (((cand.get("content") or {}).get("parts")) or []):
+                            inline = p.get("inlineData") or p.get("inline_data") or {}
+                            data_b64 = inline.get("data")
+                            if data_b64:
+                                return base64.b64decode(data_b64)
+                    last_err = f"{model} no image part"
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_err = f"{model}: {e}"
+                logging.warning("gemini img try: %s", e)
     raise RuntimeError(last_err or "ساخت تصویر Gemini ناموفق")
 
 
@@ -7888,12 +7881,17 @@ async def starzy_photo_scheduler_task(client, user_id: int):
                 continue
             h, mi = parsed_t
             now = datetime.now(TEHRAN_TIMEZONE)
+            # نزدیک ساعت هدف هر ۵ ثانیه چک کن
             if now.hour != h or now.minute != mi:
-                await asyncio.sleep(15)
+                # اگر کمتر از ۲ دقیقه تا هدف مانده، سریع‌تر چک کن
+                target_mins = h * 60 + mi
+                now_mins = now.hour * 60 + now.minute
+                diff = (target_mins - now_mins) % (24 * 60)
+                await asyncio.sleep(5 if diff <= 2 else 20)
                 continue
             day_key = now.strftime("%Y-%m-%d")
             if conf.get("last_fire") == day_key:
-                await asyncio.sleep(40)
+                await asyncio.sleep(30)
                 continue
             # قفل تا دوبار شلیک نشود
             async with _starzy_lock():
@@ -7918,14 +7916,17 @@ async def starzy_photo_scheduler_task(client, user_id: int):
                 chat_ref, msg_id = parsed
                 try:
                     ok, stars, info = await _starzy_pay_and_unlock(client, chat_ref, msg_id)
-                    conf["last_fire"] = day_key
-                    STARZY_PHOTO[user_id] = conf
-                    try:
-                        persist_all_user_settings(user_id)
-                    except Exception:
-                        pass
-                    try:
-                        if ok:
+                    attempts = int(conf.get("attempts") or 0) + 1
+                    conf["attempts"] = attempts
+                    if ok:
+                        conf["last_fire"] = day_key
+                        conf["attempts"] = 0
+                        STARZY_PHOTO[user_id] = conf
+                        try:
+                            persist_all_user_settings(user_id)
+                        except Exception:
+                            pass
+                        try:
                             await client.send_message(
                                 "me",
                                 f"⭐ <b>عکس استارزی باز شد</b>\n"
@@ -7934,13 +7935,29 @@ async def starzy_photo_scheduler_task(client, user_id: int):
                                 f"✅ {info}",
                                 parse_mode=ParseMode.HTML,
                             )
-                        else:
+                        except Exception:
+                            pass
+                    else:
+                        # ناموفق — دوباره در همین دقیقه تلاش (حداکثر ۳ بار)
+                        STARZY_PHOTO[user_id] = conf
+                        try:
                             await client.send_message(
                                 "me",
-                                f"⭐ عکس استارزی ناموفق\n💰 {stars} Stars\n❌ {info}",
+                                f"⭐ عکس استارزی ناموفق (تلاش {attempts}/3)\n💰 {stars} Stars\n❌ {info}",
                             )
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+                        if attempts >= 3:
+                            conf["last_fire"] = day_key
+                            conf["attempts"] = 0
+                            STARZY_PHOTO[user_id] = conf
+                            try:
+                                persist_all_user_settings(user_id)
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(12)
+                            continue
                 except Exception as e:
                     logging.error("starzy unlock uid=%s: %s", user_id, e)
                     try:
@@ -8770,7 +8787,7 @@ async def reply_based_controller(client, message):
         if not seed:
             await message.edit_text("❌ مثال:\n`.هوش متن گسترده + علی در روز آفتابی بیرون رفت`")
             return
-        await message.edit_text("⏳ DeepSeek در حال گسترش متن...")
+        await message.edit_text("⏳ هوش مصنوعی در حال گسترش متن...")
         try:
             expanded = await ai_expand_text(seed)
             # ویرایش همان پیام کاربر با متن گسترش‌یافته
@@ -10146,7 +10163,17 @@ async def reply_based_controller(client, message):
         SONG_SEARCH_CACHE[user_id] = tracks
         PENDING_SONG_PICK[user_id] = True
 
-        header = f"🎵 سرچ آهنگ | self MR\n\n🔎 {q}\n📌 {len(tracks)} نتیجه — روی دکمه بزن"
+        # لیست شماره‌دار در همان چت (گروه / پیوی)
+        lines = [f"🎵 سرچ آهنگ | self MR\n\n🔎 {q}\n📌 {len(tracks)} نتیجه\n"]
+        for i, t in enumerate(tracks):
+            ar = (t.get("artist") or "").strip()
+            ti = (t.get("title") or "آهنگ").strip()
+            lines.append(f"{i+1}. {ar + ' — ' if ar else ''}{ti}")
+        lines.append("\n👉 شماره آهنگ را بفرست (مثلاً `1`) یا دکمه پایین را بزن.")
+        list_text = "\n".join(lines)
+        if len(list_text) > 3900:
+            list_text = list_text[:3900] + "\n…"
+
         rows = []
         for i, t in enumerate(tracks):
             ar = (t.get("artist") or "").strip()
@@ -10155,28 +10182,27 @@ async def reply_based_controller(client, message):
             label = label[:64]
             rows.append([InlineKeyboardButton(label, callback_data=f"song_dl_{user_id}_{i}")])
 
-        sent = False
-        # دکمه اینلاین از ربات منیجر (هر آهنگ یک دکمه)
+        # 1) ویرایش پیام خود کاربر در همان چت
+        try:
+            await message.edit_text(list_text)
+        except Exception as e:
+            logging.warning(f"song edit list: {e}")
+            try:
+                await client.send_message(message.chat.id, list_text)
+            except Exception:
+                pass
+
+        # 2) اینلاین منیجر در همان چت (اگر ربات عضو باشد)
         try:
             await manager_bot.send_message(
                 message.chat.id,
-                header,
+                f"🎵 انتخاب سریع — {q}",
                 reply_markup=InlineKeyboardMarkup(rows),
             )
-            sent = True
         except Exception as e1:
             logging.warning(f"song inline chat: {e1}")
-            try:
-                await manager_bot.send_message(
-                    user_id,
-                    header + "\n\n(در پیوی — ربات را به گروه اضافه کن تا اینجا هم بیاید)",
-                    reply_markup=InlineKeyboardMarkup(rows),
-                )
-                sent = True
-            except Exception as e2:
-                logging.warning(f"song inline pm: {e2}")
 
-        # کیبورد سلف (هر آهنگ یک دکمه) — همیشه
+        # 3) کیبورد سلف در همان چت
         kb_rows = []
         for i, t in enumerate(tracks):
             ar = (t.get("artist") or "").strip()
@@ -10188,20 +10214,11 @@ async def reply_based_controller(client, message):
         try:
             await client.send_message(
                 message.chat.id,
-                "⬇️ یا از دکمه‌های پایین یکی را انتخاب کن:",
+                "⬇️ شماره یا دکمه آهنگ را انتخاب کن:",
                 reply_markup=ReplyKeyboardMarkup(kb_rows, resize_keyboard=True, one_time_keyboard=True),
             )
-            sent = True
         except Exception as e:
             logging.warning(f"song reply kb: {e}")
-
-        try:
-            if sent:
-                await message.edit_text("✅ نتایج آماده است — روی دکمه آهنگ بزن.")
-            else:
-                await message.edit_text("❌ ارسال دکمه‌ها ناموفق بود.")
-        except Exception:
-            pass
         return
 
     # انتخاب آهنگ با شماره / دکمه کیبورد سلف
@@ -10727,7 +10744,37 @@ async def _prompt_to_english(prompt: str) -> str:
     p = (prompt or "").strip()
     if not p:
         return p
-    # اگر تقریباً فقط انگلیسی/اعداد است همان را برگردان
+    # دیکشنری موضوعات رایج تا اشتباه ترجمه نشود
+    _map = {
+        "گربه": "a real domestic cat animal",
+        "گربه ها": "real domestic cats animals",
+        "سگ": "a real dog animal",
+        "اسب": "a real horse animal",
+        "شیر": "a real lion animal",
+        "ببر": "a real tiger animal",
+        "پرنده": "a real bird animal",
+        "ماشین": "a car vehicle",
+        "طبیعت": "beautiful nature landscape",
+        "کوه": "mountain landscape",
+        "دریا": "ocean sea landscape",
+        "گل": "flowers",
+        "درخت": "tree",
+        "خانه": "a house building",
+        "شهر": "city skyline",
+        "غذا": "delicious food",
+        "پیتزا": "pizza food",
+        "مافیا": "mafia themed scene",
+    }
+    low = p.strip()
+    for fa, en0 in _map.items():
+        if low == fa or low.replace(" ", "") == fa:
+            return en0
+        if fa in low and len(low) <= len(fa) + 12:
+            # «گربه سفید» و مشابه
+            rest = low.replace(fa, "").strip()
+            if rest:
+                return f"{en0}, {rest}"
+            return en0
     try:
         ascii_ratio = sum(1 for ch in p if ord(ch) < 128) / max(1, len(p))
         if ascii_ratio > 0.85:
@@ -10745,7 +10792,7 @@ async def _prompt_to_english(prompt: str) -> str:
 
 
 async def ai_generate_image_file(prompt: str) -> str:
-    """تولید تصویر — اول Gemini، بعد pollinations"""
+    """تولید تصویر دقیق — Gemini سپس چند منبع رایگان با پرامپت سخت‌گیرانه"""
     import urllib.parse
     prompt = (prompt or "").strip()
     if not prompt:
@@ -10753,30 +10800,38 @@ async def ai_generate_image_file(prompt: str) -> str:
     seed = int(time.time()) % 1000000
     path = f"/tmp/ai_img_{int(time.time())}_{seed}.jpg"
 
-    # 1) Gemini image models
+    # ترجمه + نگه داشتن اصل
+    en = await _prompt_to_english(prompt)
+    # پرامپت دقیق: موضوع اصلی + ممنوعیت جایگزینی با انسان
+    strict = (
+        f"{en}, exact subject only, highly detailed photorealistic, "
+        f"NOT a random person, NOT unrelated scene, focus on: {en}"
+    )
+    # اگر کاربر فارسی نوشته، اصل را هم بچسبان
+    if any("\u0600" <= ch <= "\u06FF" for ch in prompt):
+        strict = f"{strict}, (original request: {prompt})"
+
+    # 1) Gemini
     if GEMINI_API_KEY:
         try:
-            en = await _prompt_to_english(prompt)
-            data = await _gemini_generate_image_bytes(en or prompt)
+            data = await _gemini_generate_image_bytes(f"{en} | {prompt}")
             if data and len(data) > 2000:
-                # detect png vs jpg
                 out = path
                 if data[:8] == b"\x89PNG\r\n\x1a\n":
                     out = path.replace(".jpg", ".png")
                 with open(out, "wb") as f:
                     f.write(data)
-                logging.info("gemini image ok bytes=%s path=%s", len(data), out)
+                logging.info("gemini image ok bytes=%s", len(data))
                 return out
         except Exception as e:
-            logging.warning("gemini image gen: %s", e)
+            logging.warning("gemini image gen skip: %s", e)
 
-    # 2) pollinations fallback
-    en = await _prompt_to_english(prompt)
-    full = f"{en}, photorealistic, highly detailed, 4k"
+    # 2) منابع رایگان با پرامپت سخت
     candidates = [
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}?width=1024&height=1024&nologo=true&model=flux&seed={seed}",
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(en)}?width=1024&height=1024&nologo=true&seed={seed}",
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}?width=768&height=768&nologo=true",
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(strict)}?width=1024&height=1024&nologo=true&model=flux&seed={seed}&enhance=true",
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(en)}?width=1024&height=1024&nologo=true&model=flux&seed={seed}",
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(strict)}?width=768&height=768&nologo=true&seed={seed}",
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(en + ' animal' if 'cat' in en.lower() or 'dog' in en.lower() or 'گربه' in prompt or 'سگ' in prompt else en)}?width=1024&height=1024&nologo=true&model=flux&seed={seed+1}",
     ]
     last_err = None
     timeout = aiohttp.ClientTimeout(total=180)
