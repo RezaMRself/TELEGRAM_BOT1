@@ -6984,41 +6984,56 @@ def _sender_set(user_id: int, chat_id: int, **kwargs):
 
 
 async def _sender_send_once(client, user_id: int, chat_id: int, cfg: dict) -> bool:
-    """یک بار ارسال بنر در گروه — کانال نامعتبر را علامت می‌زند"""
+    """یک بار ارسال بنر — کانال مرده را از لیست حذف می‌کند"""
     bchat = cfg.get("banner_chat_id")
     bmsg = cfg.get("banner_msg_id")
     if not bchat or not bmsg:
         return False
     mode = (cfg.get("mode") or "copy").lower()
-    try:
-        # اطمینان از دسترسی به مقصد
+    fatal_keys = (
+        "CHANNEL_INVALID", "PEER_ID_INVALID", "CHANNEL_PRIVATE",
+        "CHAT_ID_INVALID", "USER_BANNED", "CHAT_WRITE_FORBIDDEN",
+    )
+
+    def _mark_dead(err: str):
+        cfg["enabled"] = False
+        cfg["fail_count"] = 99
+        cfg["last_error"] = (err or "")[:120]
+        cfg["dead"] = True
         try:
-            await client.get_chat(int(chat_id))
-        except Exception as e0:
-            err0 = str(e0)
-            if any(x in err0 for x in ("CHANNEL_INVALID", "PEER_ID_INVALID", "CHANNEL_PRIVATE", "CHAT_ID_INVALID")):
-                cfg["fail_count"] = int(cfg.get("fail_count") or 0) + 3
-                cfg["last_error"] = err0[:120]
-                logging.warning("sender invalid target uid=%s chat=%s: %s", user_id, chat_id, err0[:80])
-                return False
+            uid = int(user_id)
+            cid = str(int(chat_id))
+            if uid in SENDER_CONFIG and cid in SENDER_CONFIG[uid]:
+                # حذف کامل از لیست تا دیگر تلاش نشود
+                SENDER_CONFIG[uid].pop(cid, None)
+            persist_all_user_settings(user_id)
+        except Exception:
+            pass
+        logging.info("sender removed dead chat uid=%s chat=%s", user_id, chat_id)
+
+    try:
         if mode == "forward":
             await client.forward_messages(int(chat_id), int(bchat), int(bmsg))
         else:
             await client.copy_message(int(chat_id), int(bchat), int(bmsg))
         cfg["fail_count"] = 0
+        cfg["dead"] = False
         return True
     except Exception as e:
         err = str(e)
+        if any(x in err for x in fatal_keys):
+            _mark_dead(err)
+            return False
+        if "PERSISTENT_TIMESTAMP_OUTDATED" in err or "RPC_CALL_FAIL" in err:
+            # خطای موقت تلگرام — لاگ کم‌صدا
+            logging.debug("sender temp tg issue uid=%s chat=%s", user_id, chat_id)
+            return False
         cfg["fail_count"] = int(cfg.get("fail_count") or 0) + 1
         cfg["last_error"] = err[:120]
-        # خطای کانال نامعتبر — سریع‌تر خاموش شود
-        if any(x in err for x in ("CHANNEL_INVALID", "PEER_ID_INVALID", "CHANNEL_PRIVATE", "CHAT_ID_INVALID", "USER_BANNED")):
-            cfg["fail_count"] = max(cfg["fail_count"], 3)
-        # timestamp outdated — موقت، فقط لاگ کوتاه
-        if "PERSISTENT_TIMESTAMP_OUTDATED" in err or "RPC_CALL_FAIL" in err:
-            logging.warning("sender temp telegram issue uid=%s chat=%s", user_id, chat_id)
+        if cfg["fail_count"] >= 5:
+            _mark_dead(err)
         else:
-            logging.warning("sender send uid=%s chat=%s: %s", user_id, chat_id, err[:120])
+            logging.debug("sender soft fail uid=%s chat=%s: %s", user_id, chat_id, err[:100])
         return False
 
 
@@ -7037,6 +7052,11 @@ async def sender_loop_task(client: Client, user_id: int):
             if not configs:
                 await asyncio.sleep(8)
                 continue
+            # پاکسازی چت‌های مرده
+            for _cid, _cfg in list(configs.items()):
+                if not _cfg or _cfg.get("dead") or int(_cfg.get("fail_count") or 0) >= 99:
+                    configs.pop(_cid, None)
+            SENDER_CONFIG[user_id] = configs
             now = int(time.time())
             for cid_str, cfg in list(configs.items()):
                 if not cfg or not cfg.get("enabled"):
