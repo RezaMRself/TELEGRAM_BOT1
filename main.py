@@ -5008,7 +5008,10 @@ async def outgoing_message_modifier(client, message):
                 logging.warning(f"premium emoji convert: {e}")
 
         text_font = TEXT_FONT_STATUS.get(user_id, "none")
-        logging.info(f"FONT-HANDLER uid={user_id} font={text_font!r} chat={message.chat.id} mid={message.id} text={stripped[:40]!r}")
+        if text_font and text_font != "none":
+            logging.info(f"FONT-HANDLER uid={user_id} font={text_font!r} chat={message.chat.id} mid={message.id} text={stripped[:40]!r}")
+        else:
+            logging.debug(f"FONT-HANDLER uid={user_id} font=none chat={message.chat.id}")
 
         if not text_font or text_font == "none" or text_font not in FONT_KEYS_ORDER:
             # ترجمه alone
@@ -6981,20 +6984,41 @@ def _sender_set(user_id: int, chat_id: int, **kwargs):
 
 
 async def _sender_send_once(client, user_id: int, chat_id: int, cfg: dict) -> bool:
-    """یک بار ارسال بنر در گروه"""
+    """یک بار ارسال بنر در گروه — کانال نامعتبر را علامت می‌زند"""
     bchat = cfg.get("banner_chat_id")
     bmsg = cfg.get("banner_msg_id")
     if not bchat or not bmsg:
         return False
     mode = (cfg.get("mode") or "copy").lower()
     try:
+        # اطمینان از دسترسی به مقصد
+        try:
+            await client.get_chat(int(chat_id))
+        except Exception as e0:
+            err0 = str(e0)
+            if any(x in err0 for x in ("CHANNEL_INVALID", "PEER_ID_INVALID", "CHANNEL_PRIVATE", "CHAT_ID_INVALID")):
+                cfg["fail_count"] = int(cfg.get("fail_count") or 0) + 3
+                cfg["last_error"] = err0[:120]
+                logging.warning("sender invalid target uid=%s chat=%s: %s", user_id, chat_id, err0[:80])
+                return False
         if mode == "forward":
             await client.forward_messages(int(chat_id), int(bchat), int(bmsg))
         else:
             await client.copy_message(int(chat_id), int(bchat), int(bmsg))
+        cfg["fail_count"] = 0
         return True
     except Exception as e:
-        logging.warning(f"sender send uid={user_id} chat={chat_id}: {e}")
+        err = str(e)
+        cfg["fail_count"] = int(cfg.get("fail_count") or 0) + 1
+        cfg["last_error"] = err[:120]
+        # خطای کانال نامعتبر — سریع‌تر خاموش شود
+        if any(x in err for x in ("CHANNEL_INVALID", "PEER_ID_INVALID", "CHANNEL_PRIVATE", "CHAT_ID_INVALID", "USER_BANNED")):
+            cfg["fail_count"] = max(cfg["fail_count"], 3)
+        # timestamp outdated — موقت، فقط لاگ کوتاه
+        if "PERSISTENT_TIMESTAMP_OUTDATED" in err or "RPC_CALL_FAIL" in err:
+            logging.warning("sender temp telegram issue uid=%s chat=%s", user_id, chat_id)
+        else:
+            logging.warning("sender send uid=%s chat=%s: %s", user_id, chat_id, err[:120])
         return False
 
 
@@ -7032,12 +7056,33 @@ async def sender_loop_task(client: Client, user_id: int):
                 last = int(cfg.get("last_send") or 0)
                 if now - last < delay:
                     continue
-                ok = await _sender_send_once(client, user_id, int(cid_str), cfg)
+                try:
+                    target_id = int(cid_str)
+                except Exception:
+                    continue
+                ok = await _sender_send_once(client, user_id, target_id, cfg)
                 if ok:
                     cfg["sent_hour"] = sent + 1
                     cfg["last_send"] = now
+                    cfg["fail_count"] = 0
                     SENDER_CONFIG[user_id][cid_str] = cfg
-                await asyncio.sleep(1.2)
+                else:
+                    # بعد از چند شکست پشت‌سرهم، سندر این چت را خاموش کن
+                    fails = int(cfg.get("fail_count") or 0)
+                    if fails >= 3:
+                        cfg["enabled"] = False
+                        SENDER_CONFIG[user_id][cid_str] = cfg
+                        logging.warning(
+                            "sender auto-disabled uid=%s chat=%s fails=%s err=%s",
+                            user_id, cid_str, fails, (cfg.get("last_error") or "")[:80],
+                        )
+                        try:
+                            persist_all_user_settings(user_id)
+                        except Exception:
+                            pass
+                    else:
+                        SENDER_CONFIG[user_id][cid_str] = cfg
+                await asyncio.sleep(1.5)
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             break
@@ -11057,9 +11102,9 @@ async def start_bot_instance(session_string: str, phone: str, user_id: int, font
             client.add_handler(MessageHandler(outgoing_sticker_premium_handler, filters.sticker & (filters.outgoing | filters.me)), group=-21)
             client.add_handler(MessageHandler(outgoing_message_modifier, filters.text & filters.outgoing), group=-20)
             client.add_handler(MessageHandler(outgoing_message_modifier, filters.text & filters.me), group=-19)
-            client.add_handler(MessageHandler(help_controller, filters.me & filters.regex("^راهنما$")))
-            client.add_handler(MessageHandler(panel_command_controller, filters.me & filters.regex(r"^(پنل|panel)$")))
-            client.add_handler(MessageHandler(reply_based_controller, filters.me))
+            client.add_handler(MessageHandler(help_controller, (filters.me | filters.outgoing) & filters.regex("^راهنما$")))
+            client.add_handler(MessageHandler(panel_command_controller, (filters.me | filters.outgoing) & filters.regex(r"^(پنل|panel)$")))
+            client.add_handler(MessageHandler(reply_based_controller, filters.me | filters.outgoing))
             client.add_handler(MessageHandler(first_comment_handler, filters.channel), group=5)
             client.add_handler(CallbackQueryHandler(song_download_callback, filters.regex(r"^song_dl_")), group=6)
 
